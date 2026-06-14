@@ -1,45 +1,17 @@
 // Background service worker (Manifest V3)
-// - Stores API key and language settings in chrome.storage.local
-// - Fetches images cross-origin and sends them to Gemini for OCR+translation
-// - Returns structured results with bounding boxes in percentages
+import {
+  DEFAULT_SETTINGS,
+  DEFAULT_MODEL_BY_PROVIDER,
+  requiresApiKey,
+  normalizeBaseUrl,
+  buildMITConfig,
+  mapLangToMIT,
+  getLanguageLabel,
+} from "./shared/settings.js";
 
-const DEFAULT_SETTINGS = {
-  modelProvider: "gemini",
-  geminiApiKey: "",
-  openaiApiKey: "",
-  deepseekApiKey: "",
-  groqApiKey: "",
-  ollamaApiKey: "",
-  ollamaBaseUrl: "http://localhost:11434",
-  sourceLanguage: "ja",
-  targetLanguage: "en",
-  model: "gemini-1.5-flash",
-  compactOverlayMode: false,
-  replaceTextBlocks: true,
-  autoTranslateThenEdit: true,
-  autoTranslateAll: false,
-  enableByDefault: false,
-};
-
-// Track sparkle intervals per tab (legacy; kept for cleanup safety)
-const tabSparkleIntervals = new Map();
-
-// Track per-tab translator enabled state
 const tabEnabledState = new Map();
-const DEFAULT_MODEL_BY_PROVIDER = {
-  gemini: "gemini-1.5-flash",
-  openai: "gpt-4o-mini",
-  deepseek: "deepseek-chat",
-  groq: "meta-llama/llama-4-scout-17b-16e-instruct",
-  ollama: "llava:latest",
-};
 
-function stopSparkle(tabId) {
-  const h = tabSparkleIntervals.get(tabId);
-  if (h) {
-    clearInterval(h);
-    tabSparkleIntervals.delete(tabId);
-  }
+function clearTabBadge(tabId) {
   try {
     chrome.action.setBadgeText({ tabId, text: "" });
   } catch {}
@@ -52,27 +24,23 @@ function isTabEnabled(tabId) {
 function setTabEnabled(tabId, enabled) {
   if (enabled) {
     tabEnabledState.set(tabId, true);
-    startSparkle(tabId);
+    setActiveTabBadge(tabId);
   } else {
     tabEnabledState.delete(tabId);
-    stopSparkle(tabId);
+    clearTabBadge(tabId);
   }
 }
 
-function startSparkle(tabId) {
-  // No blinking; just a static star badge while active
-  stopSparkle(tabId);
+function setActiveTabBadge(tabId) {
   try {
-    chrome.action.setBadgeBackgroundColor({ tabId, color: "#0284c7" }); // sky-600
+    chrome.action.setBadgeBackgroundColor({ tabId, color: "#0284c7" });
     chrome.action.setBadgeText({ tabId, text: "★" });
   } catch {}
 }
 
 function getSettings() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(DEFAULT_SETTINGS, (items) => {
-      resolve(items);
-    });
+    chrome.storage.local.get(DEFAULT_SETTINGS, resolve);
   });
 }
 
@@ -85,11 +53,17 @@ function setSettings(partial) {
 async function arrayBufferToBase64(buffer) {
   let binary = "";
   const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
+  for (let i = 0; i < bytes.byteLength; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
+}
+
+function base64ToBlob(base64, mime) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime || "image/png" });
 }
 
 async function fetchImageAsBase64(url) {
@@ -101,227 +75,147 @@ async function fetchImageAsBase64(url) {
   }
   const buffer = await response.arrayBuffer();
   const mime = response.headers.get("content-type") || "image/jpeg";
-  const base64 = await arrayBufferToBase64(buffer);
-  return { base64, mime };
+  return { base64: await arrayBufferToBase64(buffer), mime };
+}
+
+async function resolveImagePayload({ url, inlineBase64, inlineMime, tabId, elementRect, pageScale }) {
+  if (inlineBase64) {
+    return { base64: inlineBase64, mime: inlineMime || "image/png" };
+  }
+  try {
+    return await fetchImageAsBase64(url);
+  } catch (e) {
+    if (!tabId || !elementRect) throw e;
+    const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: "png" });
+    const cropResp = await chrome.tabs.sendMessage(tabId, {
+      type: "MT_CROP_SCREENSHOT",
+      payload: { dataUrl, elementRect, pageScale },
+    });
+    if (!cropResp?.ok) throw e;
+    return { base64: cropResp.base64, mime: "image/png" };
+  }
 }
 
 function buildPrompt(sourceLanguage, targetLanguage) {
-  const src =
+  const srcLabel =
     sourceLanguage === "auto"
-      ? "the source language (likely Japanese/Korean/Chinese)"
-      : sourceLanguage;
+      ? "the source language (auto-detect from the image)"
+      : getLanguageLabel(sourceLanguage);
+  const tgtLabel = getLanguageLabel(targetLanguage);
   return (
-    `You are an OCR+translation assistant for manga/comics images.\n` +
-    `- Detect all text in ${src}.\n` +
-    `- Translate into ${targetLanguage}.\n` +
-    `- Return tight bounding boxes around each text block.\n` +
-    `Return STRICT JSON only in this schema (no markdown fences, no extra text):\n` +
-    `{"texts":[{"source":"string","translation":"string","x":0,"y":0,"width":0,"height":0}]}` +
-    `\nCoordinates are percentages (0-100) of the image from the top-left. Use multiple entries for separate bubbles/lines.` +
-    `\nIf precise boxes are unknown, still return texts with best-guess x/y/width/height values.`
+    `You are a professional manga/comic OCR and translation assistant.\n` +
+    `Task: detect every speech bubble, caption, and on-image text block, then translate into ${tgtLabel}.\n` +
+    `Source language: ${srcLabel}.\n\n` +
+    `Rules:\n` +
+    `- One JSON entry per distinct text block (each bubble or caption is separate).\n` +
+    `- Bounding boxes must tightly cover ONLY the text area inside the bubble, not the bubble border or artwork.\n` +
+    `- Preserve natural manga reading order (top-to-bottom, right-to-left for Japanese; top-to-bottom, left-to-right for English/Korean).\n` +
+    `- Translate dialogue naturally for manga (keep tone, honorifics where appropriate, concise phrasing for bubbles).\n` +
+    `- For vertical text blocks, set "direction":"vertical"; otherwise "direction":"horizontal".\n` +
+    `- Use ellipsis (…) for trailing off speech; keep punctuation natural in ${tgtLabel}.\n\n` +
+    `Return STRICT JSON only (no markdown, no commentary):\n` +
+    `{"texts":[{"source":"original text","translation":"translated text","x":0,"y":0,"width":0,"height":0,"direction":"horizontal"}]}\n` +
+    `Coordinates are percentages (0-100) from the top-left of the image.\n` +
+    `Include ALL visible text blocks with accurate boxes.`
   );
 }
 
-async function callOpenAI({
+async function callOpenAICompatible({
+  providerName,
+  url,
   apiKey,
   model,
   base64,
   mime,
   sourceLanguage,
   targetLanguage,
+  maxTokens = 4096,
 }) {
-  const url = "https://api.openai.com/v1/chat/completions";
-  const prompt = buildPrompt(sourceLanguage, targetLanguage);
-
-  const body = {
-    model: model,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:${mime};base64,${base64}`,
-              detail: "high"
-            }
-          }
-        ]
-      }
-    ],
-    max_tokens: 1024,
-    temperature: 0.1
-  };
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `OpenAI request failed: ${response.status} ${response.statusText} ${text}`
-    );
-  }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content || "";
-
-  return parseVisionResponse(content);
-}
-
-async function callDeepSeek({
-  apiKey,
-  model,
-  base64,
-  mime,
-  sourceLanguage,
-  targetLanguage,
-}) {
-  const url = "https://api.deepseek.com/chat/completions";
-  const prompt = buildPrompt(sourceLanguage, targetLanguage);
-
-  const body = {
-    model: model,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:${mime};base64,${base64}`,
-              detail: "high"
-            }
-          }
-        ]
-      }
-    ],
-    max_tokens: 1024,
-    temperature: 0.1
-  };
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `DeepSeek request failed: ${response.status} ${response.statusText} ${text}`
-    );
-  }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content || "";
-
-  return parseVisionResponse(content);
-}
-
-async function callGroq({
-  apiKey,
-  model,
-  base64,
-  mime,
-  sourceLanguage,
-  targetLanguage,
-}) {
-  const url = "https://api.groq.com/openai/v1/chat/completions";
-  const prompt = buildPrompt(sourceLanguage, targetLanguage);
-
-  const body = {
-    model: model,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:${mime};base64,${base64}`,
-              detail: "high",
-            },
-          },
-        ],
-      },
-    ],
-    max_tokens: 1024,
-    temperature: 0.1,
-  };
-
   const response = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: buildPrompt(sourceLanguage, targetLanguage) },
+            {
+              type: "image_url",
+              image_url: { url: `data:${mime};base64,${base64}`, detail: "high" },
+            },
+          ],
+        },
+      ],
+      max_tokens: maxTokens,
+      temperature: 0.1,
+    }),
   });
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(
-      `Groq request failed: ${response.status} ${response.statusText} ${text}`
+      `${providerName} request failed: ${response.status} ${response.statusText} ${text}`
     );
   }
 
   const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content || "";
-
-  return parseVisionResponse(content);
+  return parseVisionResponse(data?.choices?.[0]?.message?.content || "");
 }
 
-function normalizeOllamaBaseUrl(url) {
-  const raw = String(url || "").trim();
-  if (!raw) return "http://localhost:11434";
-  return raw.replace(/\/+$/, "");
+async function callGeminiVision({ apiKey, model, base64, mime, sourceLanguage, targetLanguage }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            { text: buildPrompt(sourceLanguage, targetLanguage) },
+            { inline_data: { mime_type: mime, data: base64 } },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        topK: 32,
+        topP: 1,
+        maxOutputTokens: 4096,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Gemini request failed: ${response.status} ${response.statusText} ${text}`
+    );
+  }
+
+  const data = await response.json();
+  return parseVisionResponse(data?.candidates?.[0]?.content?.parts?.[0]?.text || "");
 }
 
-async function callOllama({
-  model,
-  base64,
-  sourceLanguage,
-  targetLanguage,
-  baseUrl,
-  apiKey,
-}) {
-  const url = `${normalizeOllamaBaseUrl(baseUrl)}/api/chat`;
-  const prompt = buildPrompt(sourceLanguage, targetLanguage);
+async function callOllama({ model, base64, sourceLanguage, targetLanguage, baseUrl, apiKey }) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-  const body = {
-    model: model,
-    stream: false,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-        images: [base64],
-      },
-    ],
-    options: {
-      temperature: 0.1,
-    },
-  };
-
-  const response = await fetch(url, {
+  const response = await fetch(`${normalizeBaseUrl(baseUrl, DEFAULT_SETTINGS.ollamaBaseUrl)}/api/chat`, {
     method: "POST",
     headers,
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model,
+      stream: false,
+      messages: [
+        { role: "user", content: buildPrompt(sourceLanguage, targetLanguage), images: [base64] },
+      ],
+      options: { temperature: 0.1 },
+    }),
   });
 
   if (!response.ok) {
@@ -332,8 +226,109 @@ async function callOllama({
   }
 
   const data = await response.json();
-  const content = data?.message?.content || "";
-  return parseVisionResponse(content);
+  return parseVisionResponse(data?.message?.content || "");
+}
+
+async function callGlmOcr({ model, base64, mime, sourceLanguage, targetLanguage, baseUrl, apiKey }) {
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  const response = await fetch(
+    `${normalizeBaseUrl(baseUrl, DEFAULT_SETTINGS.glmocrBaseUrl)}/v1/chat/completions`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: model || "zai-org/GLM-OCR",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: buildPrompt(sourceLanguage, targetLanguage) },
+              { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } },
+            ],
+          },
+        ],
+        max_tokens: 4096,
+        temperature: 0.1,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `GLM-OCR request failed: ${response.status} ${response.statusText} ${text}`
+    );
+  }
+
+  const data = await response.json();
+  return parseVisionResponse(data?.choices?.[0]?.message?.content || "");
+}
+
+function convertMITJsonToExtensionFormat(mitData, imgWidth, imgHeight, targetLanguage) {
+  const targetMIT = mapLangToMIT(targetLanguage);
+  const w = Math.max(1, Number(imgWidth) || 1);
+  const h = Math.max(1, Number(imgHeight) || 1);
+
+  const texts = (mitData?.translations || [])
+    .map((item) => {
+      const textMap = item?.text || {};
+      const translation = String(textMap[targetMIT] || "");
+      const sourceKey =
+        Object.keys(textMap).find((k) => k !== targetMIT) || Object.keys(textMap)[0] || "";
+      const minX = Number(item.minX) || 0;
+      const minY = Number(item.minY) || 0;
+      const maxX = Number(item.maxX) || minX;
+      const maxY = Number(item.maxY) || minY;
+      return {
+        source: String(textMap[sourceKey] || ""),
+        translation,
+        x: (minX / w) * 100,
+        y: (minY / h) * 100,
+        width: ((maxX - minX) / w) * 100,
+        height: ((maxY - minY) / h) * 100,
+      };
+    })
+    .filter((t) => t.translation.length > 0);
+
+  return { texts };
+}
+
+async function callMIT({ settings, base64, mime, targetLanguage, inPlaceMode }) {
+  const baseUrl = normalizeBaseUrl(settings.mitBaseUrl, DEFAULT_SETTINGS.mitBaseUrl);
+  const blob = base64ToBlob(base64, mime);
+  const formData = new FormData();
+  formData.append("image", blob, "image.png");
+  formData.append("config", JSON.stringify(buildMITConfig(settings, targetLanguage)));
+
+  const endpoint = inPlaceMode ? "/translate/with-form/image" : "/translate/with-form/json";
+  const response = await fetch(`${baseUrl}${endpoint}`, { method: "POST", body: formData });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Manga Image Translator request failed: ${response.status} ${response.statusText} ${text}`
+    );
+  }
+
+  if (inPlaceMode) {
+    return {
+      translatedImageBase64: await arrayBufferToBase64(await response.arrayBuffer()),
+      mime: "image/png",
+    };
+  }
+
+  const data = await response.json();
+  let imgWidth = 1;
+  let imgHeight = 1;
+  try {
+    const bitmap = await createImageBitmap(blob);
+    imgWidth = bitmap.width;
+    imgHeight = bitmap.height;
+    bitmap.close();
+  } catch {}
+  return convertMITJsonToExtensionFormat(data, imgWidth, imgHeight, targetLanguage);
 }
 
 function extractFirstJsonObject(text) {
@@ -346,19 +341,12 @@ function extractFirstJsonObject(text) {
   for (let i = start; i < src.length; i++) {
     const ch = src[i];
     if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === "\\") {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
       continue;
     }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
+    if (ch === '"') { inString = true; continue; }
     if (ch === "{") depth += 1;
     if (ch === "}") {
       depth -= 1;
@@ -376,14 +364,10 @@ function parseTextLinesFallback(content) {
   const candidates = [];
   for (const line of lines) {
     if (line.length < 2) continue;
-    const cleaned = line
-      .replace(/^[-*•\d\).\s]+/, "")
-      .replace(/^"(.*)"$/, "$1")
-      .trim();
+    const cleaned = line.replace(/^[-*•\d\).\s]+/, "").replace(/^"(.*)"$/, "$1").trim();
     if (cleaned.length >= 2) candidates.push(cleaned);
   }
-  const unique = [...new Set(candidates)].slice(0, 20);
-  return unique.map((translation, i) => ({
+  return [...new Set(candidates)].slice(0, 20).map((translation, i) => ({
     source: "",
     translation,
     x: 3,
@@ -396,59 +380,41 @@ function parseTextLinesFallback(content) {
 function parseVisionResponse(content) {
   const raw = String(content || "").trim();
   let parsed = null;
-
-  // Attempt strict parse first
-  try {
-    parsed = JSON.parse(raw);
-  } catch {}
-
-  // Then try extracting the first balanced JSON object from mixed text
+  try { parsed = JSON.parse(raw); } catch {}
   if (!parsed) {
     const firstObj = extractFirstJsonObject(raw);
     if (firstObj) {
-      try {
-        parsed = JSON.parse(firstObj);
-      } catch {}
+      try { parsed = JSON.parse(firstObj); } catch {}
     }
   }
 
-  // Accept both {texts:[...]} and direct array responses
   if (Array.isArray(parsed)) parsed = { texts: parsed };
   if (!parsed || !Array.isArray(parsed.texts)) parsed = { texts: [] };
+  parsed.texts = parsed.texts.flat(Infinity);
 
-  const toPercentOrNull = (value) => {
+  const toPercent = (value) => {
     const num = Number(value);
-    if (!Number.isFinite(num)) return null;
-    return Math.max(0, Math.min(100, num));
-  };
-  const normalizeBox = (item) => {
-    const x = toPercentOrNull(item?.x ?? item?.left);
-    const y = toPercentOrNull(item?.y ?? item?.top);
-    const width = toPercentOrNull(item?.width ?? item?.w);
-    const height = toPercentOrNull(item?.height ?? item?.h);
-    if (x == null || y == null || width == null || height == null) {
-      return { x: 0, y: 0, width: 0, height: 0 };
-    }
-    const maxWidth = Math.max(0, 100 - x);
-    const maxHeight = Math.max(0, 100 - y);
-    const safeWidth = Math.min(width, maxWidth);
-    const safeHeight = Math.min(height, maxHeight);
-    if (safeWidth <= 0.25 || safeHeight <= 0.25) {
-      return { x: 0, y: 0, width: 0, height: 0 };
-    }
-    return { x, y, width: safeWidth, height: safeHeight };
+    return Number.isFinite(num) ? Math.max(0, Math.min(100, num)) : null;
   };
 
   const normalized = parsed.texts
     .map((t) => {
-      const box = normalizeBox(t);
+      const x = toPercent(t?.x ?? t?.left);
+      const y = toPercent(t?.y ?? t?.top);
+      const width = toPercent(t?.width ?? t?.w);
+      const height = toPercent(t?.height ?? t?.h);
+      const hasBox = x != null && y != null && width != null && height != null;
+      const safeWidth = hasBox ? Math.min(width, Math.max(0, 100 - x)) : 0;
+      const safeHeight = hasBox ? Math.min(height, Math.max(0, 100 - y)) : 0;
+      const validBox = safeWidth > 0.25 && safeHeight > 0.25;
       return {
         source: String(t?.source || t?.japanese || t?.original || t?.text || ""),
         translation: String(t?.translation || t?.english || t?.translated || ""),
-        x: box.x,
-        y: box.y,
-        width: box.width,
-        height: box.height,
+        direction: t?.direction === "vertical" ? "vertical" : "horizontal",
+        x: validBox ? x : 0,
+        y: validBox ? y : 0,
+        width: validBox ? safeWidth : 0,
+        height: validBox ? safeHeight : 0,
       };
     })
     .filter((t) => t.translation.length > 0);
@@ -464,120 +430,53 @@ function parseVisionResponse(content) {
     };
   }
 
-  // Last resort: convert plain text output into visible overlays
-  const fallbackTexts = parseTextLinesFallback(raw);
-  return { texts: fallbackTexts };
-}
-
-async function callGeminiVision({
-  apiKey,
-  model,
-  base64,
-  mime,
-  sourceLanguage,
-  targetLanguage,
-}) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-    apiKey
-  )}`;
-  const prompt = buildPrompt(sourceLanguage, targetLanguage);
-
-  const body = {
-    contents: [
-      {
-        parts: [
-          { text: prompt },
-          {
-            inline_data: {
-              mime_type: mime,
-              data: base64,
-            },
-          },
-        ],
-      },
-    ],
-    generationConfig: {
-      temperature: 0.1,
-      topK: 32,
-      topP: 1,
-      maxOutputTokens: 1024,
-    },
-  };
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `Gemini request failed: ${response.status} ${response.statusText} ${text}`
-    );
-  }
-
-  const data = await response.json();
-  const content = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-  return parseVisionResponse(content);
+  return { texts: parseTextLinesFallback(raw) };
 }
 
 async function callAIModel(settings, base64, mime, sourceLanguage, targetLanguage) {
   const { modelProvider } = settings;
   const apiKey = settings[`${modelProvider}ApiKey`];
-  const selectedModel =
-    settings.model || DEFAULT_MODEL_BY_PROVIDER[modelProvider] || DEFAULT_SETTINGS.model;
-  
-  if (modelProvider !== "ollama" && !apiKey) {
+  const model = settings.model || DEFAULT_MODEL_BY_PROVIDER[modelProvider] || DEFAULT_SETTINGS.model;
+
+  if (requiresApiKey(modelProvider) && !apiKey) {
     throw new Error(`Missing ${modelProvider.toUpperCase()} API key. Set it in the Settings.`);
   }
 
   switch (modelProvider) {
     case "gemini":
-      return await callGeminiVision({
-        apiKey,
-        model: selectedModel,
-        base64,
-        mime,
-        sourceLanguage,
-        targetLanguage,
-      });
+      return callGeminiVision({ apiKey, model, base64, mime, sourceLanguage, targetLanguage });
     case "openai":
-      return await callOpenAI({
-        apiKey,
-        model: selectedModel,
-        base64,
-        mime,
-        sourceLanguage,
-        targetLanguage,
+      return callOpenAICompatible({
+        providerName: "OpenAI",
+        url: "https://api.openai.com/v1/chat/completions",
+        apiKey, model, base64, mime, sourceLanguage, targetLanguage,
       });
     case "deepseek":
-      return await callDeepSeek({
-        apiKey,
-        model: selectedModel,
-        base64,
-        mime,
-        sourceLanguage,
-        targetLanguage,
+      return callOpenAICompatible({
+        providerName: "DeepSeek",
+        url: "https://api.deepseek.com/chat/completions",
+        apiKey, model, base64, mime, sourceLanguage, targetLanguage,
       });
     case "groq":
-      return await callGroq({
-        apiKey,
-        model: selectedModel,
-        base64,
-        mime,
-        sourceLanguage,
-        targetLanguage,
+      return callOpenAICompatible({
+        providerName: "Groq",
+        url: "https://api.groq.com/openai/v1/chat/completions",
+        apiKey, model, base64, mime, sourceLanguage, targetLanguage,
       });
     case "ollama":
-      return await callOllama({
-        apiKey,
-        model: selectedModel,
-        base64,
-        sourceLanguage,
-        targetLanguage,
+      return callOllama({
+        apiKey, model, base64, sourceLanguage, targetLanguage,
         baseUrl: settings.ollamaBaseUrl || DEFAULT_SETTINGS.ollamaBaseUrl,
+      });
+    case "glmocr":
+      return callGlmOcr({
+        apiKey, model, base64, mime, sourceLanguage, targetLanguage,
+        baseUrl: settings.glmocrBaseUrl || DEFAULT_SETTINGS.glmocrBaseUrl,
+      });
+    case "mit":
+      return callMIT({
+        settings, base64, mime, targetLanguage,
+        inPlaceMode: Boolean(settings.inPlaceMode),
       });
     default:
       throw new Error(`Unsupported model provider: ${modelProvider}`);
@@ -585,168 +484,140 @@ async function callAIModel(settings, base64, mime, sourceLanguage, targetLanguag
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  try {
-    chrome.contextMenus.create({
-      id: "translate-image",
-      title: "Translate image",
-      contexts: ["image"],
-    });
-  } catch {}
-  try {
-    chrome.contextMenus.create({
-      id: "translate-all-images",
-      title: "Translate all images on page",
-      contexts: ["page"],
-    });
-  } catch {}
+  for (const [id, title, contexts] of [
+    ["translate-image", "Translate image", ["image"]],
+    ["translate-all-images", "Translate all images on page", ["page"]],
+  ]) {
+    try {
+      chrome.contextMenus.create({ id, title, contexts });
+    } catch {}
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  stopSparkle(tabId);
+  clearTabBadge(tabId);
   tabEnabledState.delete(tabId);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || !message.type) return;
+  if (!message?.type) return;
 
-  if (message.type === "GET_SETTINGS") {
-    getSettings().then(sendResponse);
-    return true;
-  }
-
-  if (message.type === "GET_TAB_ENABLED") {
-    const tabId = sender?.tab?.id;
-    sendResponse({ ok: true, enabled: isTabEnabled(tabId) });
-    return;
-  }
-
-  if (message.type === "SET_TAB_ENABLED") {
-    const tabId = sender?.tab?.id;
-    const enabled = Boolean(message.enabled);
-    setTabEnabled(tabId, enabled);
-    sendResponse({ ok: true, enabled: isTabEnabled(tabId) });
-    return;
-  }
-
-  if (message.type === "SET_SETTINGS") {
-    setSettings(message.payload || {}).then(() => sendResponse({ ok: true }));
-    return true;
-  }
-
-  if (message.type === "TRANSLATE_IMAGE") {
-    (async () => {
-      try {
-        const settings = await getSettings();
-        const { modelProvider } = settings;
-        const apiKey = settings[`${modelProvider}ApiKey`];
-        
-        if (modelProvider !== "ollama" && !apiKey) {
-          throw new Error(`Missing ${modelProvider.toUpperCase()} API key. Set it in the Settings.`);
-        }
-
-        const {
-          url,
-          inlineBase64,
-          inlineMime,
-          tabId,
-          elementRect,
-          pageScale,
-          overrideSourceLanguage,
-          overrideTargetLanguage,
-        } = message.payload;
-        const resolvedTabId = tabId || (sender && sender.tab && sender.tab.id);
-
-        let base64, mime;
-        if (inlineBase64) {
-          base64 = inlineBase64;
-          mime = inlineMime || "image/png";
-        } else {
-          try {
-            ({ base64, mime } = await fetchImageAsBase64(url));
-          } catch (e) {
-            if (resolvedTabId && elementRect) {
-              const dataUrl = await chrome.tabs.captureVisibleTab(undefined, {
-                format: "png",
-              });
-              const cropResp = await chrome.tabs.sendMessage(resolvedTabId, {
-                type: "MT_CROP_SCREENSHOT",
-                payload: { dataUrl, elementRect, pageScale },
-              });
-              if (!cropResp || !cropResp.ok) throw e;
-              base64 = cropResp.base64;
-              mime = "image/png";
-            } else {
-              throw e;
-            }
+  switch (message.type) {
+    case "GET_SETTINGS":
+      getSettings().then(sendResponse);
+      return true;
+    case "GET_TAB_ENABLED":
+      sendResponse({ ok: true, enabled: isTabEnabled(sender?.tab?.id) });
+      return;
+    case "SET_TAB_ENABLED": {
+      const tabId = sender?.tab?.id;
+      setTabEnabled(tabId, Boolean(message.enabled));
+      sendResponse({ ok: true, enabled: isTabEnabled(tabId) });
+      return;
+    }
+    case "SET_SETTINGS":
+      setSettings(message.payload || {}).then(() => sendResponse({ ok: true }));
+      return true;
+    case "TRANSLATE_IMAGE":
+    case "TRANSLATE_REGION":
+      (async () => {
+        try {
+          const settings = await getSettings();
+          const { modelProvider } = settings;
+          if (requiresApiKey(modelProvider) && !settings[`${modelProvider}ApiKey`]) {
+            throw new Error(`Missing ${modelProvider.toUpperCase()} API key. Set it in the Settings.`);
           }
+
+          const tabId = message.payload.tabId || sender?.tab?.id;
+          let base64;
+          let mime = "image/png";
+
+          if (message.type === "TRANSLATE_REGION") {
+            const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: "png" });
+            const cropResp = await chrome.tabs.sendMessage(tabId, {
+              type: "MT_CROP_SCREENSHOT",
+              payload: {
+                dataUrl,
+                elementRect: message.payload.elementRect,
+                pageScale: message.payload.pageScale,
+              },
+            });
+            if (!cropResp?.ok) throw new Error(cropResp?.error || "Screenshot crop failed");
+            base64 = cropResp.base64;
+            const result = await callAIModel(
+              settings,
+              base64,
+              mime,
+              message.payload.overrideSourceLanguage || settings.sourceLanguage,
+              message.payload.overrideTargetLanguage || settings.targetLanguage
+            );
+            sendResponse({ ok: true, result, cropBase64: base64 });
+            return;
+          }
+
+          const resolved = await resolveImagePayload({
+            ...message.payload,
+            tabId,
+          });
+          base64 = resolved.base64;
+          mime = resolved.mime;
+
+          const result = await callAIModel(
+            settings,
+            base64,
+            mime,
+            message.payload.overrideSourceLanguage || settings.sourceLanguage,
+            message.payload.overrideTargetLanguage || settings.targetLanguage
+          );
+          sendResponse({ ok: true, result });
+        } catch (err) {
+          sendResponse({ ok: false, error: String(err?.message || err) });
         }
-        const result = await callAIModel(
-          settings,
-          base64,
-          mime,
-          overrideSourceLanguage ||
-            settings.sourceLanguage ||
-            DEFAULT_SETTINGS.sourceLanguage,
-          overrideTargetLanguage ||
-            settings.targetLanguage ||
-            DEFAULT_SETTINGS.targetLanguage
-        );
-        sendResponse({ ok: true, result });
-      } catch (err) {
-        sendResponse({
-          ok: false,
-          error: String(err && err.message ? err.message : err),
-        });
-      }
-    })();
-    return true; // keep the message channel open for async
+      })();
+      return true;
+    default:
+      return;
   }
 });
 
-// Context menu: right-click → Translate this image or the whole page
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
+
   if (info.menuItemId === "translate-image" && info.srcUrl) {
     try {
       const settings = await getSettings();
       const { modelProvider } = settings;
-      const apiKey = settings[`${modelProvider}ApiKey`];
-      
-      if (modelProvider !== "ollama" && !apiKey) {
+      if (requiresApiKey(modelProvider) && !settings[`${modelProvider}ApiKey`]) {
         await chrome.tabs.sendMessage(tab.id, {
           type: "MT_NOTIFY",
           payload: { message: `Set ${modelProvider.toUpperCase()} API key in Settings` },
         });
         return;
       }
+
       const { base64, mime } = await fetchImageAsBase64(info.srcUrl);
       const result = await callAIModel(
         settings,
         base64,
         mime,
-        settings.sourceLanguage || DEFAULT_SETTINGS.sourceLanguage,
-        settings.targetLanguage || DEFAULT_SETTINGS.targetLanguage
+        settings.sourceLanguage,
+        settings.targetLanguage
       );
       await chrome.tabs.sendMessage(tab.id, {
-        type: "MT_OVERLAY_RESULT",
+        type: "MT_TRANSLATE_RESULT",
         payload: { url: info.srcUrl, result },
       });
     } catch (err) {
       try {
         await chrome.tabs.sendMessage(tab.id, {
           type: "MT_NOTIFY",
-          payload: {
-            message: `Translate failed: ${String(
-              err && err.message ? err.message : err
-            )}`,
-          },
+          payload: { message: `Translate failed: ${String(err?.message || err)}` },
         });
       } catch {}
     }
     return;
   }
 
-  // One-shot: translate all images currently in the document (same as popup "Translate Once").
   if (info.menuItemId === "translate-all-images") {
     try {
       await chrome.tabs.sendMessage(tab.id, { type: "MT_TRANSLATE_ALL_NOW" });

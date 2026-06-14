@@ -1,0 +1,8 @@
+torch
+torchvision
+transformers>=4.52.0
+accelerate
+fastapi
+uvicorn[standard]
+pillow
+pydantic

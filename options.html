@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title> Translator</title>
+    <title>Image Text Translator — Options</title>
     <style>
       body {
         font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto,
@@ -75,6 +75,8 @@
         <option value="deepseek">DeepSeek</option>
         <option value="groq">Groq</option>
         <option value="ollama">Ollama (Local)</option>
+        <option value="glmocr">GLM-OCR (Local)</option>
+        <option value="mit">Manga Image Translator (Local)</option>
       </select>
 
       <div id="geminiApiSection">
@@ -99,6 +101,52 @@
         <label for="ollamaApiKey">Ollama API Key (Optional)</label>
         <input id="ollamaApiKey" type="password" placeholder="Optional bearer token" />
       </div>
+      <div id="glmocrApiSection" style="display: none">
+        <label for="glmocrBaseUrl">GLM-OCR Server URL</label>
+        <input id="glmocrBaseUrl" type="text" placeholder="http://localhost:8080" />
+        <p class="hint">Run <strong>start_server.bat</strong> from the server/ folder, or use vLLM/SGLang/Ollama to serve zai-org/GLM-OCR.</p>
+        <label for="glmocrApiKey">API Key (Optional)</label>
+        <input id="glmocrApiKey" type="password" placeholder="Optional bearer token" />
+      </div>
+      <div id="mitApiSection" style="display: none">
+        <label for="mitBaseUrl">Manga Image Translator Server URL</label>
+        <input id="mitBaseUrl" type="text" placeholder="http://localhost:5003" />
+        <p class="hint">
+          Start the server from <strong>manga-image-translator</strong>:
+          <code>cd server && python main.py --use-gpu --start-instance</code>
+        </p>
+        <label for="mitTranslator">Translator backend (configured in MIT)</label>
+        <select id="mitTranslator">
+          <option value="youdao">Youdao</option>
+          <option value="baidu">Baidu</option>
+          <option value="deepl">DeepL</option>
+          <option value="papago">Papago</option>
+          <option value="sugoi">Sugoi (JA→EN, offline)</option>
+          <option value="offline">Offline</option>
+          <option value="openai">OpenAI (via MIT config)</option>
+          <option value="gemini">Gemini (via MIT config)</option>
+          <option value="sakura">Sakura</option>
+        </select>
+        <div class="row">
+          <div>
+            <label for="mitDetector">Text detector</label>
+            <select id="mitDetector">
+              <option value="default">Default</option>
+              <option value="ctd">CTD</option>
+              <option value="paddle">Paddle</option>
+            </select>
+          </div>
+          <div>
+            <label for="mitInpainter">Inpainter</label>
+            <select id="mitInpainter">
+              <option value="lama_large">Lama Large</option>
+              <option value="default">Default</option>
+              <option value="lama_mpe">Lama MPE</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+        </div>
+      </div>
 
       <div class="row">
         <div>
@@ -107,6 +155,7 @@
             <option value="ja">Japanese</option>
             <option value="ko">Korean</option>
             <option value="zh">Chinese</option>
+            <option value="en">English</option>
             <option value="auto">Auto-detect</option>
           </select>
         </div>
@@ -114,6 +163,10 @@
           <label for="targetLanguage">Target Language</label>
           <select id="targetLanguage">
             <option value="en">English</option>
+            <option value="zh">Chinese (Simplified)</option>
+            <option value="zh-TW">Chinese (Traditional)</option>
+            <option value="ja">Japanese</option>
+            <option value="ko">Korean</option>
             <option value="es">Spanish</option>
             <option value="fr">French</option>
             <option value="de">German</option>
@@ -129,8 +182,11 @@
         <option value="gpt-4o" data-provider="openai" style="display: none">gpt-4o</option>
         <option value="gpt-4o-mini" data-provider="openai" style="display: none">gpt-4o-mini</option>
         <option value="deepseek-chat" data-provider="deepseek" style="display: none">deepseek-chat</option>
-        <option value="meta-llama/llama-4-scout-17b-16e-instruct" data-provider="groq" style="display: none">llama-4-scout</option>
+        <option value="llama-3.2-11b-vision-preview" data-provider="groq" style="display: none">llama-3.2-11b</option>
+        <option value="llama-3.2-90b-vision-preview" data-provider="groq" style="display: none">llama-3.2-90b</option>
         <option value="llava:latest" data-provider="ollama" style="display: none">llava:latest</option>
+        <option value="zai-org/GLM-OCR" data-provider="glmocr" style="display: none">GLM-OCR</option>
+        <option value="manga-image-translator" data-provider="mit" style="display: none">Manga Image Translator</option>
       </select>
 
       <p class="hint">
@@ -159,11 +215,17 @@
           >Auto-translate then allow inline English edits</label
         >
       </div>
+      <div class="switch">
+        <input id="inPlaceMode" type="checkbox" />
+        <label for="inPlaceMode" style="margin: 0"
+          >In-place translation (paint text onto image)</label
+        >
+      </div>
 
       <button id="save" class="btn">Save</button>
       <span id="status" class="ok" style="margin-left: 8px"></span>
     </div>
 
-    <script src="options.js"></script>
+    <script type="module" src="options.js"></script>
   </body>
 </html>

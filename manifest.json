@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Image Text Translator",
-  "version": "2.1.0",
-  "description": "Translate text on images (e.g.,manga,manhwa) directly on webpages using LLM",
+  "version": "2.3.0",
+  "description": "Translate text on images (e.g., manga, manhwa) directly on webpages using LLM",
   "action": {
     "default_title": "Image Text Translator",
     "default_popup": "popup.html"
@@ -14,7 +14,9 @@
   "permissions": ["storage", "activeTab", "tabs", "scripting", "contextMenus"],
   "host_permissions": [
     "<all_urls>",
-    "https://generativelanguage.googleapis.com/*"
+    "https://generativelanguage.googleapis.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -24,8 +26,14 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
+      "type": "module",
       "run_at": "document_idle"
     }
   ],
-  "web_accessible_resources": []
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/translate_icon_32.svg"],
+      "matches": ["<all_urls>"]
+    }
+  ]
 }

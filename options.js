@@ -1,22 +1,9 @@
-const DEFAULTS = {
-  modelProvider: "gemini",
-  geminiApiKey: "",
-  openaiApiKey: "",
-  deepseekApiKey: "",
-  groqApiKey: "",
-  ollamaApiKey: "",
-  ollamaBaseUrl: "http://localhost:11434",
-  sourceLanguage: "ja",
-  targetLanguage: "en",
-  model: "gemini-1.5-flash",
-  compactOverlayMode: false,
-  replaceTextBlocks: true,
-  autoTranslateThenEdit: true,
-};
+import { DEFAULT_SETTINGS } from "./shared/settings.js";
+import { updateProviderSections } from "./shared/ui.js";
 
 function getSettings() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(DEFAULTS, (items) => resolve(items));
+    chrome.storage.local.get(DEFAULT_SETTINGS, resolve);
   });
 }
 
@@ -34,55 +21,21 @@ async function init() {
   document.getElementById("deepseekApiKey").value = s.deepseekApiKey || "";
   document.getElementById("groqApiKey").value = s.groqApiKey || "";
   document.getElementById("ollamaApiKey").value = s.ollamaApiKey || "";
-  document.getElementById("ollamaBaseUrl").value =
-    s.ollamaBaseUrl || "http://localhost:11434";
+  document.getElementById("ollamaBaseUrl").value = s.ollamaBaseUrl || DEFAULT_SETTINGS.ollamaBaseUrl;
+  document.getElementById("glmocrApiKey").value = s.glmocrApiKey || "";
+  document.getElementById("glmocrBaseUrl").value = s.glmocrBaseUrl || DEFAULT_SETTINGS.glmocrBaseUrl;
+  document.getElementById("mitBaseUrl").value = s.mitBaseUrl || DEFAULT_SETTINGS.mitBaseUrl;
+  document.getElementById("mitTranslator").value = s.mitTranslator || DEFAULT_SETTINGS.mitTranslator;
+  document.getElementById("mitDetector").value = s.mitDetector || DEFAULT_SETTINGS.mitDetector;
+  document.getElementById("mitInpainter").value = s.mitInpainter || DEFAULT_SETTINGS.mitInpainter;
   document.getElementById("sourceLanguage").value = s.sourceLanguage || "ja";
   document.getElementById("targetLanguage").value = s.targetLanguage || "en";
-  const savedModel = s.model || "gemini-1.5-flash";
-  document.getElementById("model").value = savedModel;
-  const compactEl = document.getElementById("compactOverlayMode");
-  if (compactEl) compactEl.checked = Boolean(s.compactOverlayMode);
-  const replaceEl = document.getElementById("replaceTextBlocks");
-  if (replaceEl) replaceEl.checked = Boolean(s.replaceTextBlocks);
-  const autoEditEl = document.getElementById("autoTranslateThenEdit");
-  if (autoEditEl) autoEditEl.checked = Boolean(s.autoTranslateThenEdit);
-  updateProviderSections(document.getElementById("modelProvider").value, savedModel);
-}
-
-function updateProviderSections(provider, preferredModel) {
-  const sections = {
-    gemini: document.getElementById("geminiApiSection"),
-    openai: document.getElementById("openaiApiSection"),
-    deepseek: document.getElementById("deepseekApiSection"),
-    groq: document.getElementById("groqApiSection"),
-    ollama: document.getElementById("ollamaApiSection"),
-  };
-  Object.keys(sections).forEach((k) => {
-    if (sections[k]) sections[k].style.display = k === provider ? "block" : "none";
-  });
-
-  const defaultModels = {
-    gemini: "gemini-1.5-flash",
-    openai: "gpt-4o-mini",
-    deepseek: "deepseek-chat",
-    groq: "meta-llama/llama-4-scout-17b-16e-instruct",
-    ollama: "llava:latest",
-  };
-  const modelSelect = document.getElementById("model");
-  Array.from(modelSelect.options).forEach((option) => {
-    const p = option.getAttribute("data-provider");
-    option.style.display = p === provider ? "block" : "none";
-  });
-  const isPreferredForProvider = Boolean(
-    preferredModel &&
-      modelSelect.querySelector(
-        `option[data-provider="${provider}"][value="${preferredModel}"]`
-      )
-  );
-  modelSelect.value =
-    isPreferredForProvider
-      ? preferredModel
-      : defaultModels[provider] || "gemini-1.5-flash";
+  document.getElementById("model").value = s.model || DEFAULT_SETTINGS.model;
+  document.getElementById("compactOverlayMode").checked = Boolean(s.compactOverlayMode);
+  document.getElementById("replaceTextBlocks").checked = Boolean(s.replaceTextBlocks);
+  document.getElementById("autoTranslateThenEdit").checked = Boolean(s.autoTranslateThenEdit);
+  document.getElementById("inPlaceMode").checked = Boolean(s.inPlaceMode);
+  updateProviderSections(s.modelProvider || "gemini", s.model);
 }
 
 async function save() {
@@ -93,16 +46,20 @@ async function save() {
     deepseekApiKey: document.getElementById("deepseekApiKey").value.trim(),
     groqApiKey: document.getElementById("groqApiKey").value.trim(),
     ollamaApiKey: document.getElementById("ollamaApiKey").value.trim(),
-    ollamaBaseUrl: document
-      .getElementById("ollamaBaseUrl")
-      .value.trim() || "http://localhost:11434",
+    ollamaBaseUrl: document.getElementById("ollamaBaseUrl").value.trim() || DEFAULT_SETTINGS.ollamaBaseUrl,
+    glmocrApiKey: document.getElementById("glmocrApiKey").value.trim(),
+    glmocrBaseUrl: document.getElementById("glmocrBaseUrl").value.trim() || DEFAULT_SETTINGS.glmocrBaseUrl,
+    mitBaseUrl: document.getElementById("mitBaseUrl").value.trim() || DEFAULT_SETTINGS.mitBaseUrl,
+    mitTranslator: document.getElementById("mitTranslator").value,
+    mitDetector: document.getElementById("mitDetector").value,
+    mitInpainter: document.getElementById("mitInpainter").value,
     sourceLanguage: document.getElementById("sourceLanguage").value,
     targetLanguage: document.getElementById("targetLanguage").value,
     model: document.getElementById("model").value,
     compactOverlayMode: document.getElementById("compactOverlayMode").checked,
     replaceTextBlocks: document.getElementById("replaceTextBlocks").checked,
-    autoTranslateThenEdit: document.getElementById("autoTranslateThenEdit")
-      .checked,
+    autoTranslateThenEdit: document.getElementById("autoTranslateThenEdit").checked,
+    inPlaceMode: document.getElementById("inPlaceMode").checked,
   };
   await setSettings(payload);
   const status = document.getElementById("status");
@@ -114,6 +71,7 @@ document.getElementById("save").addEventListener("click", save);
 document.getElementById("modelProvider").addEventListener("change", (e) => {
   updateProviderSections(e.target.value);
 });
+
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", init);
 } else {
